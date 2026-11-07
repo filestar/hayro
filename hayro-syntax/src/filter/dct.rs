@@ -120,11 +120,11 @@ fn box_reduce(
     height: u32,
     components: usize,
     factor: u32,
-) -> alloc::vec::Vec<u8> {
+) -> Vec<u8> {
     let (w, h, f) = (width as usize, height as usize, factor as usize);
     let (ow, oh) = (w.div_ceil(f), h.div_ceil(f));
-    let mut out = alloc::vec::Vec::with_capacity(ow * oh * components);
-    let mut acc = alloc::vec![0u32; ow * components];
+    let mut out = Vec::with_capacity(ow * oh * components);
+    let mut acc = alloc::vec![0_u32; ow * components];
     for by in 0..oh {
         acc.iter_mut().for_each(|a| *a = 0);
         let rows = (by * f..((by + 1) * f).min(h)).len();
