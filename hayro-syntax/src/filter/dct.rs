@@ -114,13 +114,47 @@ pub(crate) fn decode(
 
 /// Average `factor` x `factor` blocks of interleaved 8-bit samples (the last row and column of blocks may be
 /// smaller).
-fn box_reduce(
-    data: &[u8],
-    width: u32,
-    height: u32,
-    components: usize,
-    factor: u32,
-) -> Vec<u8> {
+fn box_reduce(data: &[u8], width: u32, height: u32, components: usize, factor: u32) -> Vec<u8> {
+    // The component count is a constant in each copy, so the sums of a block's pixels compile to straight
+    // additions: the general loop took 2.9 s to reduce a 10804 x 21604 CMYK image, longer than its decoding.
+    match components {
+        1 => box_reduce_n::<1>(data, width, height, factor),
+        3 => box_reduce_n::<3>(data, width, height, factor),
+        4 => box_reduce_n::<4>(data, width, height, factor),
+        _ => box_reduce_any(data, width, height, components, factor),
+    }
+}
+
+fn box_reduce_n<const C: usize>(data: &[u8], width: u32, height: u32, factor: u32) -> Vec<u8> {
+    let (w, h, f) = (width as usize, height as usize, factor as usize);
+    let (ow, oh) = (w.div_ceil(f), h.div_ceil(f));
+    let mut out = Vec::with_capacity(ow * oh * C);
+    let mut acc = alloc::vec![[0_u32; C]; ow];
+    for by in 0..oh {
+        acc.iter_mut().for_each(|a| *a = [0; C]);
+        let rows = (by * f..((by + 1) * f).min(h)).len();
+        for y in by * f..by * f + rows {
+            let row = &data[y * w * C..(y + 1) * w * C];
+            for (a, block) in acc.iter_mut().zip(row.chunks(f * C)) {
+                for px in block.as_chunks::<C>().0 {
+                    for c in 0..C {
+                        a[c] += px[c] as u32;
+                    }
+                }
+            }
+        }
+        for (bx, a) in acc.iter().enumerate() {
+            let cols = (bx * f..((bx + 1) * f).min(w)).len();
+            let n = (rows * cols) as u32;
+            for &v in a {
+                out.push(((v + n / 2) / n) as u8);
+            }
+        }
+    }
+    out
+}
+
+fn box_reduce_any(data: &[u8], width: u32, height: u32, components: usize, factor: u32) -> Vec<u8> {
     let (w, h, f) = (width as usize, height as usize, factor as usize);
     let (ow, oh) = (w.div_ceil(f), h.div_ceil(f));
     let mut out = Vec::with_capacity(ow * oh * components);
@@ -232,12 +266,29 @@ fn find_sof_marker(data: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::box_reduce;
+    use super::{box_reduce, box_reduce_any};
 
     #[test]
     fn box_reduce_averages_whole_and_partial_blocks() {
         // 3 x 2 pixels, 2 components; factor 2 gives 2 x 1: a 2 x 2 block and a 1 x 2 block.
         let data = [0, 100, 10, 100, 50, 0, 20, 100, 30, 100, 70, 0];
         assert_eq!(box_reduce(&data, 3, 2, 2, 2), [15, 100, 60, 0]);
+    }
+
+    #[test]
+    fn the_copies_for_one_three_and_four_components_agree_with_the_general_loop() {
+        let (w, h) = (23_u32, 17_u32);
+        for components in [1, 3, 4] {
+            let data: Vec<u8> = (0..(w * h) as usize * components)
+                .map(|i| (i * 37 % 251) as u8)
+                .collect();
+            for factor in [2, 3, 5] {
+                assert_eq!(
+                    box_reduce(&data, w, h, components, factor),
+                    box_reduce_any(&data, w, h, components, factor),
+                    "{components} components, factor {factor}"
+                );
+            }
+        }
     }
 }
