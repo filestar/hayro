@@ -1,4 +1,5 @@
 use crate::FillRule;
+use crate::BlendMode;
 use crate::color::ColorSpace;
 use crate::context::Context;
 use crate::convert::{convert_line_cap, convert_line_join};
@@ -23,6 +24,7 @@ use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use std::sync::Arc;
 
+pub(crate) mod annotation;
 pub(crate) mod path;
 pub(crate) mod stack;
 pub(crate) mod state;
@@ -230,6 +232,17 @@ fn interpret_annotation<'a>(
         context.restore_state(device);
     } else if annot.get::<Dict<'_>>(AP).is_some() {
         (context.settings.warning_sink)(InterpreterWarning::UnresolvedAnnotationAppearance);
+    } else if let Some(synth) = annotation::synthesise(annot) {
+        // No appearance at all: draw it the way the viewers do (see `annotation`).
+        let group = synth.opacity < 1.0 || synth.multiply;
+        if group {
+            let blend = if synth.multiply { BlendMode::Multiply } else { BlendMode::Normal };
+            device.push_transparency_group(synth.opacity, None, blend);
+        }
+        interpret(TypedIter::new(synth.ops.as_bytes()), resources, context, device);
+        if group {
+            device.pop_transparency_group();
+        }
     }
 }
 
