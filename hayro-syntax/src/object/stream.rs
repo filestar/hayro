@@ -19,6 +19,13 @@ use smallvec::SmallVec;
 struct FiltersAndParams<'a> {
     filters: SmallVec<[Filter; 2]>,
     params: SmallVec<[Dict<'a>; 2]>,
+    /// A filter named `…Decode` that this reader does not know: the data cannot be decoded. Other unknown
+    /// names (writers' junk) are skipped as before.
+    unknown: bool,
+}
+
+fn unknown_decode_filter(name: &Name<'_>) -> bool {
+    Filter::from_name(name.clone()).is_none() && name.as_ref().ends_with(b"Decode")
 }
 
 /// A stream of arbitrary data.
@@ -61,6 +68,14 @@ impl<'a> Stream<'a> {
     fn filters_and_params(&self) -> FiltersAndParams<'a> {
         let mut collected_filters = SmallVec::new();
         let mut collected_params = SmallVec::new();
+        let mut unknown = false;
+        if let Some(name) = self
+            .dict
+            .get::<Name<'_>>(F)
+            .or_else(|| self.dict.get::<Name<'_>>(FILTER))
+        {
+            unknown |= unknown_decode_filter(&name);
+        }
 
         if let Some(filter) = self
             .dict
@@ -81,6 +96,7 @@ impl<'a> Stream<'a> {
             .get::<Array<'_>>(F)
             .or_else(|| self.dict.get::<Array<'_>>(FILTER))
         {
+            unknown |= filters.iter::<Name<'_>>().any(|n| unknown_decode_filter(&n));
             let filters = filters.iter::<Name<'_>>().map(Filter::from_name);
             let mut params = self
                 .dict
@@ -105,6 +121,7 @@ impl<'a> Stream<'a> {
         FiltersAndParams {
             filters: collected_filters,
             params: collected_params,
+            unknown,
         }
     }
 
@@ -202,6 +219,10 @@ impl<'a> Stream<'a> {
 
         let data = self.raw_data();
         let filters_and_params = self.filters_and_params();
+        if filters_and_params.unknown {
+            // pdfium, Ghostscript and Poppler draw nothing for such a stream; its raw bytes are not the data.
+            return Err(DecodeFailure::StreamDecode);
+        }
 
         let mut current: Option<FilterResult<'a>> = None;
 
@@ -230,7 +251,7 @@ impl<'a> Stream<'a> {
     }
 
     fn crypt_filter(&self) -> Option<Name<'a>> {
-        let FiltersAndParams { filters, params } = self.filters_and_params();
+        let FiltersAndParams { filters, params, .. } = self.filters_and_params();
 
         (filters.first() == Some(&Filter::Crypt)).then(|| {
             params
