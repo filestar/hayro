@@ -58,10 +58,16 @@ impl WriteDirect for Number {
     fn write_direct(&self, obj: Obj<'_>, _: &mut ExtractionContext<'_>) {
         let float_num = self.as_f64();
 
-        // A whole number outside i32's range is written as a real: `as i32` would saturate (to i32::MIN, which
-        // pdf-writer cannot negate) and change the value.
-        if float_num.fract() == 0.0 && float_num > f64::from(i32::MIN) && float_num <= f64::from(i32::MAX) {
+        // pdf-writer cannot write i32::MIN: it takes the absolute value of the integer, and it writes a real that
+        // equals an i32 as that integer. So a value that is (or rounds to) -2^31 is written one higher, and a whole
+        // number outside i32's range as a real (`as i32` would saturate and change it).
+        if float_num.fract() == 0.0
+            && float_num > f64::from(i32::MIN)
+            && float_num <= f64::from(i32::MAX)
+        {
             obj.primitive(float_num as i32);
+        } else if (float_num as f32) == i32::MIN as f32 {
+            obj.primitive(i32::MIN + 1);
         } else {
             obj.primitive(float_num as f32);
         }
