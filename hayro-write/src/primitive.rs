@@ -60,7 +60,10 @@ impl WriteDirect for Number {
 
         // A whole number outside i32's range is written as a real: `as i32` would saturate (to i32::MIN, which
         // pdf-writer cannot negate) and change the value.
-        if float_num.fract() == 0.0 && float_num > f64::from(i32::MIN) && float_num <= f64::from(i32::MAX) {
+        if float_num.fract() == 0.0
+            && float_num > f64::from(i32::MIN)
+            && float_num <= f64::from(i32::MAX)
+        {
             obj.primitive(float_num as i32);
         } else {
             obj.primitive(float_num as f32);

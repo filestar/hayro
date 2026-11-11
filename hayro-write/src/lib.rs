@@ -16,10 +16,10 @@ use flate2::write::ZlibEncoder;
 use hayro_syntax::object::ObjRef;
 use hayro_syntax::object::Object;
 use hayro_syntax::object::dict::keys::{
-    ART_BOX, BLEED_BOX, COLORSPACE, EXT_G_STATE, FONT, GROUP, PATTERN, PROPERTIES, SHADING,
-    TRIM_BOX, USER_UNIT, XOBJECT,
+    ANNOTS, AP, ART_BOX, AS, BBOX, BLEED_BOX, COLORSPACE, EXT_G_STATE, FONT, GROUP, MATRIX,
+    PATTERN, PROPERTIES, RECT, SHADING, TRIM_BOX, USER_UNIT, XOBJECT,
 };
-use hayro_syntax::object::{Dict, MaybeRef};
+use hayro_syntax::object::{Array, Dict, MaybeRef, Stream};
 use hayro_syntax::page::{Page, Resources, Rotation};
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
 use rustc_hash::FxHashMap;
@@ -61,6 +61,10 @@ pub struct ExtractionOptions {
     /// Catalog entries to copy (for example `OCProperties`, `OutputIntents`), each as an indirect object of its
     /// own; their references are in [`ExtractionResult::catalog_entries`], in this order, for the ones that exist.
     pub catalog_keys: Vec<&'static [u8]>,
+    /// Draw a copied page's annotations into its content, as a viewer shows them: each annotation's normal
+    /// appearance (the state `AS` names) placed on its `Rect` as PDF 2.0 12.5.5 describes, hidden and no-view ones
+    /// left out. The annotations themselves are not copied, so a page that is not flattened loses them.
+    pub flatten_annotations: bool,
 }
 
 /// [`extract`] with options: what a whole-document copy needs, such as optional content and the page boxes.
@@ -75,6 +79,7 @@ pub fn extract_with<'a>(
     let mut ctx = ExtractionContext::new(new_ref, pdf, chunk_settings);
     ctx.keep_optional_content = options.keep_optional_content;
     ctx.keep_page_boxes = options.keep_page_boxes;
+    ctx.flatten_annotations = options.flatten_annotations;
 
     for query in queries {
         let page = pages
@@ -207,6 +212,7 @@ struct ExtractionContext<'a> {
     chunk_settings: ChunkSettings,
     pub(crate) keep_optional_content: bool,
     keep_page_boxes: bool,
+    flatten_annotations: bool,
 }
 
 impl<'a> ExtractionContext<'a> {
@@ -230,6 +236,7 @@ impl<'a> ExtractionContext<'a> {
             chunk_settings,
             keep_optional_content: false,
             keep_page_boxes: false,
+            flatten_annotations: false,
         }
     }
 
@@ -378,18 +385,52 @@ fn write_page(
     ctx: &mut ExtractionContext<'_>,
 ) -> Result<(), ExtractionError> {
     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
+    let annotations = if ctx.flatten_annotations {
+        annotation_appearances(page, ctx)
+    } else {
+        Vec::new()
+    };
     // Note: We can cache content stream references, but _not_ the page references themselves.
     // Acrobat for some reason doesn't like duplicate page references in the page tree.
     let stream_ref = if let Some(cached) = ctx.cached_content_streams.get(&page_idx) {
         *cached
     } else {
         let stream_ref = ctx.new_ref();
+        let content = page.page_stream().unwrap_or(b"");
+        let content = if annotations.is_empty() {
+            deflate_encode(content)
+        } else {
+            // The page's own content in a q/Q pair, so a state it leaves set does not move the annotations.
+            let mut c = Vec::with_capacity(content.len() + 64 * annotations.len());
+            c.extend_from_slice(
+                b"q
+",
+            );
+            c.extend_from_slice(content);
+            c.extend_from_slice(
+                b"
+Q
+",
+            );
+            for (name, _, m) in &annotations {
+                c.extend_from_slice(
+                    format!(
+                        "q {} {} {} {} {} {} cm /",
+                        m[0], m[1], m[2], m[3], m[4], m[5]
+                    )
+                    .as_bytes(),
+                );
+                c.extend_from_slice(name);
+                c.extend_from_slice(
+                    b" Do Q
+",
+                );
+            }
+            deflate_encode(&c)
+        };
 
         chunk
-            .stream(
-                stream_ref,
-                &deflate_encode(page.page_stream().unwrap_or(b"")),
-            )
+            .stream(stream_ref, &content)
             .filter(Filter::FlateDecode);
         ctx.cached_content_streams.insert(page_idx, stream_ref);
 
@@ -425,13 +466,91 @@ fn write_page(
         }
     }
 
-    serialize_resources(page.resources(), ctx, &mut pdf_page);
+    let extra: Vec<(Vec<u8>, Ref)> = annotations.into_iter().map(|(n, r, _)| (n, r)).collect();
+    serialize_resources(page.resources(), ctx, &mut pdf_page, &extra);
 
     pdf_page.finish();
 
     ctx.chunks.push(chunk);
 
     Ok(())
+}
+
+/// The annotations to draw on a flattened page: a name for each appearance stream (its `XObject` resource), the
+/// stream's new reference, and the matrix A that maps its transformed bounding box onto the annotation's `Rect`
+/// (PDF 2.0 12.5.5; the stream's own `Matrix` is applied by `Do`).
+fn annotation_appearances(
+    page: &Page<'_>,
+    ctx: &mut ExtractionContext<'_>,
+) -> Vec<(Vec<u8>, Ref, [f64; 6])> {
+    const HIDDEN: u32 = 1 << 1;
+    const NO_VIEW: u32 = 1 << 5;
+    let mut out = Vec::new();
+    let Some(annots) = page.raw().get::<Array<'_>>(ANNOTS) else {
+        return out;
+    };
+    for annot in annots.iter::<Dict<'_>>() {
+        if annot.get::<u32>(b"F").unwrap_or(0) & (HIDDEN | NO_VIEW) != 0 {
+            continue;
+        }
+        let Some(ap) = annot.get::<Dict<'_>>(AP) else {
+            continue;
+        };
+        let raw = match ap.get::<Object<'_>>(b"N") {
+            Some(Object::Stream(_)) => ap.get_raw::<Object<'_>>(b"N"),
+            Some(Object::Dict(states)) => annot
+                .get::<hayro_syntax::object::Name<'_>>(AS)
+                .and_then(|state| states.get_raw::<Object<'_>>(state.deref()))
+                .or_else(|| states.get_raw::<Object<'_>>(b"Off")),
+            _ => None,
+        };
+        let Some(MaybeRef::Ref(r)) = raw else {
+            continue;
+        };
+        let Some(stream) = ctx.pdf.xref().get::<Stream<'_>>(r.into()) else {
+            continue;
+        };
+        let d = stream.dict();
+        let (Some(bbox), Some(rect)) = (d.get::<[f32; 4]>(BBOX), annot.get::<[f32; 4]>(RECT))
+        else {
+            continue;
+        };
+        let m = d
+            .get::<[f64; 6]>(MATRIX)
+            .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let corners = [
+            (bbox[0], bbox[1]),
+            (bbox[2], bbox[1]),
+            (bbox[0], bbox[3]),
+            (bbox[2], bbox[3]),
+        ]
+        .map(|(x, y)| (f64::from(x), f64::from(y)))
+        .map(|(x, y)| (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]));
+        let (tx0, tx1) = corners
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.0), b.max(p.0)));
+        let (ty0, ty1) = corners
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.1), b.max(p.1)));
+        let (rx0, rx1) = (
+            f64::from(rect[0].min(rect[2])),
+            f64::from(rect[0].max(rect[2])),
+        );
+        let (ry0, ry1) = (
+            f64::from(rect[1].min(rect[3])),
+            f64::from(rect[1].max(rect[3])),
+        );
+        let (w, h) = (tx1 - tx0, ty1 - ty0);
+        if !(w > 0.0 && h > 0.0 && w.is_finite() && h.is_finite()) {
+            continue;
+        }
+        let (sx, sy) = ((rx1 - rx0) / w, (ry1 - ry0) / h);
+        let a = [sx, 0.0, 0.0, sy, rx0 - sx * tx0, ry0 - sy * ty0];
+        ctx.to_visit_refs.push(r);
+        let mapped = ctx.map_ref(r);
+        out.push((format!("HayroAnnot{}", out.len()).into_bytes(), mapped, a));
+    }
+    out
 }
 
 fn write_xobject(
@@ -464,7 +583,7 @@ fn write_xobject(
         i[5] as f32,
     ]);
 
-    serialize_resources(page.resources(), ctx, &mut x_object);
+    serialize_resources(page.resources(), ctx, &mut x_object, &[]);
 
     let raw_dict = page.raw();
 
@@ -482,6 +601,7 @@ fn serialize_resources(
     resources: &Resources<'_>,
     ctx: &mut ExtractionContext<'_>,
     writer: &mut impl ResourcesExt,
+    extra_x_objects: &[(Vec<u8>, Ref)],
 ) {
     // Resource dictionary is always required (unless it can be inherited), so
     // let's just be safe and always write it.
@@ -502,7 +622,15 @@ fn serialize_resources(
     write!(ext_g_states, EXT_G_STATE);
     write!(shadings, SHADING);
     write!(patterns, PATTERN);
-    write!(x_objects, XOBJECT);
+    if !resources.x_objects.is_empty() || !extra_x_objects.is_empty() {
+        let mut dict = output.insert(Name(XOBJECT)).dict();
+        for (name, obj) in resources.x_objects.entries() {
+            obj.write_direct(dict.insert(Name(name.deref())), ctx);
+        }
+        for (name, r) in extra_x_objects {
+            dict.pair(Name(name), *r);
+        }
+    }
     write!(color_spaces, COLORSPACE);
     write!(fonts, FONT);
     write!(properties, PROPERTIES);
