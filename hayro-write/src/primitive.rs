@@ -120,7 +120,8 @@ fn write_dict(
             continue;
         }
 
-        if !IGNORE_KEYS.contains(name.deref()) {
+        if !IGNORE_KEYS.contains(name.deref()) || (ctx.keep_optional_content && name.deref() == OC)
+        {
             val.write_direct(pdf_dict.insert(pdf_writer::Name(name.deref())), ctx);
         }
     }
