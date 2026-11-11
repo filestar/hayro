@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- `extract_with` and `ExtractionOptions`: copy a page whole rather than as an `XObject`. It can keep the page's
+  optional content (`/OC`), its trim, bleed and art boxes and `UserUnit`, and chosen document catalog entries such as
+  `OCProperties` and `OutputIntents` (`ExtractionResult::catalog_entries`). `extract` behaves as before.
+
 ## [0.9.0] - 2026-11-02
 
 This release has an [MSRV] of 1.92.

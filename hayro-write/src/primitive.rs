@@ -58,7 +58,9 @@ impl WriteDirect for Number {
     fn write_direct(&self, obj: Obj<'_>, _: &mut ExtractionContext<'_>) {
         let float_num = self.as_f64();
 
-        if float_num.fract() == 0.0 {
+        // A whole number outside i32's range is written as a real: `as i32` would saturate (to i32::MIN, which
+        // pdf-writer cannot negate) and change the value.
+        if float_num.fract() == 0.0 && float_num > f64::from(i32::MIN) && float_num <= f64::from(i32::MAX) {
             obj.primitive(float_num as i32);
         } else {
             obj.primitive(float_num as f32);
@@ -120,7 +122,8 @@ fn write_dict(
             continue;
         }
 
-        if !IGNORE_KEYS.contains(name.deref()) {
+        if !IGNORE_KEYS.contains(name.deref()) || (ctx.keep_optional_content && name.deref() == OC)
+        {
             val.write_direct(pdf_dict.insert(pdf_writer::Name(name.deref())), ctx);
         }
     }

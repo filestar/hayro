@@ -16,8 +16,10 @@ use flate2::write::ZlibEncoder;
 use hayro_syntax::object::ObjRef;
 use hayro_syntax::object::Object;
 use hayro_syntax::object::dict::keys::{
-    COLORSPACE, EXT_G_STATE, FONT, GROUP, PATTERN, PROPERTIES, SHADING, XOBJECT,
+    ART_BOX, BLEED_BOX, COLORSPACE, EXT_G_STATE, FONT, GROUP, PATTERN, PROPERTIES, SHADING,
+    TRIM_BOX, USER_UNIT, XOBJECT,
 };
+use hayro_syntax::object::{Dict, MaybeRef};
 use hayro_syntax::page::{Page, Resources, Rotation};
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
 use rustc_hash::FxHashMap;
@@ -37,8 +39,42 @@ pub fn extract<'a>(
     chunk_settings: ChunkSettings,
     queries: &[ExtractionQuery],
 ) -> Result<ExtractionResult, ExtractionError> {
+    extract_with(
+        pdf,
+        new_ref,
+        chunk_settings,
+        queries,
+        ExtractionOptions::default(),
+    )
+}
+
+/// What a copy keeps beyond what embedding a page as an `XObject` needs. The default keeps nothing more, as
+/// [`extract`] does.
+#[derive(Clone, Debug, Default)]
+pub struct ExtractionOptions {
+    /// Keep `/OC` entries (the optional content an `XObject` or annotation belongs to). Without them, and without the
+    /// catalog's `OCProperties`, content in a layer that is off is drawn. Copy `OCProperties` with
+    /// `catalog_keys` alongside.
+    pub keep_optional_content: bool,
+    /// Write a copied page's `TrimBox`, `BleedBox`, `ArtBox` and `UserUnit` as well as its media and crop box.
+    pub keep_page_boxes: bool,
+    /// Catalog entries to copy (for example `OCProperties`, `OutputIntents`), each as an indirect object of its
+    /// own; their references are in [`ExtractionResult::catalog_entries`], in this order, for the ones that exist.
+    pub catalog_keys: Vec<&'static [u8]>,
+}
+
+/// [`extract`] with options: what a whole-document copy needs, such as optional content and the page boxes.
+pub fn extract_with<'a>(
+    pdf: &Pdf,
+    new_ref: Box<dyn FnMut() -> Ref + 'a>,
+    chunk_settings: ChunkSettings,
+    queries: &[ExtractionQuery],
+    options: ExtractionOptions,
+) -> Result<ExtractionResult, ExtractionError> {
     let pages = pdf.pages();
     let mut ctx = ExtractionContext::new(new_ref, pdf, chunk_settings);
+    ctx.keep_optional_content = options.keep_optional_content;
+    ctx.keep_page_boxes = options.keep_page_boxes;
 
     for query in queries {
         let page = pages
@@ -55,6 +91,35 @@ pub fn extract<'a>(
         ctx.root_refs.push(res.map(|_| root_ref));
     }
 
+    let mut catalog_entries = Vec::new();
+    if !options.catalog_keys.is_empty()
+        && let Some(catalog) = pdf.xref().get::<Dict<'_>>(pdf.xref().root_id())
+    {
+        for key in &options.catalog_keys {
+            let Some(value) = catalog.get_raw::<Object<'_>>(key) else {
+                continue;
+            };
+            let entry_ref = match value {
+                MaybeRef::Ref(r) => {
+                    if pdf.xref().get::<Object<'_>>(r.into()).is_none() {
+                        continue;
+                    }
+                    ctx.to_visit_refs.push(r);
+                    ctx.map_ref(r)
+                }
+                MaybeRef::NotRef(Object::Stream(_)) => continue,
+                MaybeRef::NotRef(o) => {
+                    let r = ctx.new_ref();
+                    let mut chunk = Chunk::with_settings(ctx.chunk_settings);
+                    o.write_direct(chunk.indirect(r), &mut ctx);
+                    ctx.chunks.push(chunk);
+                    r
+                }
+            };
+            catalog_entries.push((key.to_vec(), entry_ref));
+        }
+    }
+
     // Now we have shallowly extracted all pages, now go through all dependencies until there aren't
     // any anymore.
     write_dependencies(pdf, &mut ctx);
@@ -69,6 +134,7 @@ pub fn extract<'a>(
         chunk: global_chunk,
         root_refs: ctx.root_refs,
         page_tree_parent_ref: ctx.page_tree_parent_ref,
+        catalog_entries,
     })
 }
 
@@ -123,6 +189,8 @@ pub struct ExtractionResult {
     pub root_refs: Vec<Result<Ref, ExtractionError>>,
     /// The reference to the page tree parent that was generated.
     pub page_tree_parent_ref: Ref,
+    /// The catalog entries asked for in [`ExtractionOptions::catalog_keys`] that exist: key and reference.
+    pub catalog_entries: Vec<(Vec<u8>, Ref)>,
 }
 
 struct ExtractionContext<'a> {
@@ -137,6 +205,8 @@ struct ExtractionContext<'a> {
     cached_content_streams: FxHashMap<usize, Ref>,
     page_tree_parent_ref: Ref,
     chunk_settings: ChunkSettings,
+    pub(crate) keep_optional_content: bool,
+    keep_page_boxes: bool,
 }
 
 impl<'a> ExtractionContext<'a> {
@@ -158,6 +228,8 @@ impl<'a> ExtractionContext<'a> {
             root_refs: Vec::new(),
             page_tree_parent_ref,
             chunk_settings,
+            keep_optional_content: false,
+            keep_page_boxes: false,
         }
     }
 
@@ -342,6 +414,15 @@ fn write_page(
 
     if let Some(group) = raw_dict.get_raw::<Object<'_>>(GROUP) {
         group.write_direct(pdf_page.insert(Name(GROUP)), ctx);
+    }
+
+    if ctx.keep_page_boxes {
+        // Not inheritable (unlike the media and crop box), so the page's own entries are all there is.
+        for key in [TRIM_BOX, BLEED_BOX, ART_BOX, USER_UNIT] {
+            if let Some(value) = raw_dict.get_raw::<Object<'_>>(key) {
+                value.write_direct(pdf_page.insert(Name(key)), ctx);
+            }
+        }
     }
 
     serialize_resources(page.resources(), ctx, &mut pdf_page);
