@@ -1,5 +1,5 @@
-use crate::FillRule;
 use crate::BlendMode;
+use crate::FillRule;
 use crate::color::ColorSpace;
 use crate::context::Context;
 use crate::convert::{convert_line_cap, convert_line_join};
@@ -14,6 +14,7 @@ use crate::shading::Shading;
 use crate::util::RectExt;
 use crate::x_object::{FormXObject, ImageXObject, XObject};
 use bitflags::bitflags;
+use hayro_syntax::annotation;
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
 use hayro_syntax::object::dict::keys::{ANNOTS, AP, AS, F, N, OC, RECT};
@@ -24,7 +25,6 @@ use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use std::sync::Arc;
 
-pub(crate) mod annotation;
 pub(crate) mod path;
 pub(crate) mod stack;
 pub(crate) mod state;
@@ -176,6 +176,22 @@ fn interpret_annotation<'a>(
         return;
     }
 
+    // An annotation in a layer that is off is not drawn (PDF 2.0 8.11.3.3, the annotation's `OC`).
+    let has_oc = crate::x_object::xobject_oc(annot, context);
+    if context.ocg_state.is_visible() {
+        interpret_visible_annotation(annot, resources, context, device);
+    }
+    if has_oc {
+        context.ocg_state.end_marked_content();
+    }
+}
+
+fn interpret_visible_annotation<'a>(
+    annot: &Dict<'a>,
+    resources: &Resources<'a>,
+    context: &mut Context<'a>,
+    device: &mut impl Device<'a>,
+) {
     if let Some(apx) = appearance_stream(annot).and_then(|o| FormXObject::new(&o)) {
         let Some(rect) = annot.get::<Rect>(RECT) else {
             return;
@@ -236,10 +252,19 @@ fn interpret_annotation<'a>(
         // No appearance at all: draw it the way the viewers do (see `annotation`).
         let group = synth.opacity < 1.0 || synth.multiply;
         if group {
-            let blend = if synth.multiply { BlendMode::Multiply } else { BlendMode::Normal };
+            let blend = if synth.multiply {
+                BlendMode::Multiply
+            } else {
+                BlendMode::Normal
+            };
             device.push_transparency_group(synth.opacity, None, blend);
         }
-        interpret(TypedIter::new(synth.ops.as_bytes()), resources, context, device);
+        interpret(
+            TypedIter::new(synth.ops.as_bytes()),
+            resources,
+            context,
+            device,
+        );
         if group {
             device.pop_transparency_group();
         }

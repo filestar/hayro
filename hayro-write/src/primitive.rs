@@ -3,7 +3,7 @@ use hayro_syntax::Filter;
 use hayro_syntax::object;
 use hayro_syntax::object::dict::keys::{
     AF, DECODE_PARMS, DP, FILTER, LAST_MODIFIED, LENGTH, METADATA, OC, OPI, PIECE_INFO, PT_DATA,
-    REF, STRUCT_PARENT, STRUCT_PARENTS,
+    REF, STRUCT_PARENT, STRUCT_PARENTS, SUBTYPE, TYPE,
 };
 use hayro_syntax::object::{MaybeRef, Null, Number, ObjectIdentifier, Stream};
 use hayro_syntax::object::{Object, array, dict};
@@ -69,8 +69,18 @@ impl WriteDirect for Number {
         } else if (float_num as f32) == i32::MIN as f32 {
             obj.primitive(i32::MIN + 1);
         } else {
-            obj.primitive(float_num as f32);
+            obj.primitive(finite_f32(float_num));
         }
+    }
+}
+
+/// A number as the nearest finite `f32`: one beyond `f32`'s range would be written as `inf`, which no PDF reader
+/// parses (readers clamp such a number to the largest real they have).
+pub(crate) fn finite_f32(v: f64) -> f32 {
+    if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32
     }
 }
 
@@ -180,36 +190,70 @@ write_indirect!(object::Name<'_>);
 write_indirect!(dict::Dict<'_>);
 write_indirect!(array::Array<'_>);
 
+/// Write a stream as a form `XObject`: as it is, with `Type` and `Subtype` added when its writer left them out
+/// (annotation appearance streams often lack them; `Do` needs them).
+pub(crate) fn write_indirect_as_form(
+    stream: &Stream<'_>,
+    chunk: &mut Chunk,
+    id: Ref,
+    ctx: &mut ExtractionContext<'_>,
+) {
+    {
+        let dict = stream.dict();
+        let has_subtype = dict.contains_key(SUBTYPE);
+        let has_type = dict.contains_key(TYPE);
+        write_stream(stream, chunk, id, ctx, |obj| {
+            if !has_type {
+                obj.pair(pdf_writer::Name(TYPE), pdf_writer::Name(b"XObject"));
+            }
+            if !has_subtype {
+                obj.pair(pdf_writer::Name(SUBTYPE), pdf_writer::Name(b"Form"));
+            }
+        });
+    }
+}
+
 impl WriteIndirect for Stream<'_> {
     fn write_indirect(&self, chunk: &mut Chunk, id: Ref, ctx: &mut ExtractionContext<'_>) {
-        let data = self.raw_data();
-        let mut obj = chunk.stream(id, &data);
-        let dict = self.dict();
+        write_stream(self, chunk, id, ctx, |_| {});
+    }
+}
 
-        if self.filters().first() != Some(&Filter::Crypt) {
-            write_dict(dict, obj.deref_mut(), ctx, &[LENGTH]);
-            return;
-        }
+fn write_stream(
+    stream: &Stream<'_>,
+    chunk: &mut Chunk,
+    id: Ref,
+    ctx: &mut ExtractionContext<'_>,
+    extra: impl FnOnce(&mut Dict<'_>),
+) {
+    let data = stream.raw_data();
+    let mut obj = chunk.stream(id, &data);
+    let dict = stream.dict();
+    extra(obj.deref_mut());
 
-        write_dict(
-            dict,
-            obj.deref_mut(),
-            ctx,
-            &[LENGTH, FILTER, DECODE_PARMS, DP],
-        );
+    if stream.filters().first() != Some(&Filter::Crypt) {
+        write_dict(dict, obj.deref_mut(), ctx, &[LENGTH]);
+        return;
+    }
 
-        for (key, sources) in [(FILTER, &[FILTER][..]), (DECODE_PARMS, &[DECODE_PARMS, DP])] {
-            let rest: Vec<_> = sources
-                .iter()
-                .find_map(|source| dict.get::<array::Array<'_>>(source))
-                .map(|array| array.raw_iter().skip(1).collect())
-                .unwrap_or_default();
+    write_dict(
+        dict,
+        obj.deref_mut(),
+        ctx,
+        &[LENGTH, FILTER, DECODE_PARMS, DP],
+    );
 
-            if !rest.is_empty() {
-                let mut array = obj.insert(pdf_writer::Name(key)).array();
-                for item in rest {
-                    item.write_direct(array.push(), ctx);
-                }
+    for (key, sources) in [(FILTER, &[FILTER][..]), (DECODE_PARMS, &[DECODE_PARMS, DP])] {
+        let rest: Vec<_> = sources
+            .iter()
+            .find_map(|source| dict.get::<array::Array<'_>>(source))
+            .map(|array| array.raw_iter().skip(1).collect())
+            .unwrap_or_default();
+
+        if !rest.is_empty() {
+            let mut array = obj.insert(pdf_writer::Name(key)).array();
+            for item in rest {
+                item.write_direct(array.push(), ctx);
             }
         }
     }

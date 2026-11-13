@@ -59,7 +59,9 @@ impl<'a> XObject<'a> {
     }
 }
 
-fn xobject_oc(dict: &Dict<'_>, context: &mut Context<'_>) -> bool {
+/// Begin the optional content `dict`'s `OC` entry names (an `XObject`'s or an annotation's); whether it had one,
+/// so the caller ends it.
+pub(crate) fn xobject_oc(dict: &Dict<'_>, context: &mut Context<'_>) -> bool {
     let Some(oc_dict) = dict.get::<Dict<'_>>(OC) else {
         return false;
     };

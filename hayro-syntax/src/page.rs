@@ -191,7 +191,8 @@ pub struct Page<'a> {
     media_box: Rect,
     crop_box: Rect,
     rotation: Rotation,
-    page_streams: OnceLock<Option<Vec<u8>>>,
+    /// The decoded content, and whether every content stream decoded.
+    page_streams: OnceLock<(Option<Vec<u8>>, bool)>,
     resources: Resources<'a>,
     ctx: ReaderContext<'a>,
 }
@@ -253,37 +254,55 @@ impl<'a> Page<'a> {
     }
 
     /// Return the decoded content stream of the page.
+    ///
+    /// A content stream that does not decode (an unknown filter, say) is left out; see
+    /// [`Page::content_decodes`].
     pub fn page_stream(&self) -> Option<&[u8]> {
+        self.decoded_content().0.as_deref()
+    }
+
+    /// Whether every content stream of the page decoded (also true when the page has no content). When it is
+    /// false, [`Page::page_stream`] holds only the streams that did, and a copy of the page should keep the
+    /// streams as they are rather than write what was decoded.
+    pub fn content_decodes(&self) -> bool {
+        self.decoded_content().1
+    }
+
+    fn decoded_content(&self) -> &(Option<Vec<u8>>, bool) {
         let convert_single = |s: Stream<'_>| {
             let data = s.decoded_data().ok()?;
             Some(data.into_owned())
         };
 
-        self.page_streams
-            .get_or_init(|| {
-                if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
-                    convert_single(stream)
-                } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
-                    let streams = array
-                        .raw_iter()
-                        .filter_map(|item| item.resolve(&self.ctx)?.into_stream())
-                        .flat_map(convert_single);
+        self.page_streams.get_or_init(|| {
+            if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
+                let data = convert_single(stream);
+                let complete = data.is_some();
+                (data, complete)
+            } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
+                let mut complete = true;
+                let mut collected = vec![];
 
-                    let mut collected = vec![];
-
-                    for stream in streams {
-                        collected.extend(stream);
-                        // Streams must have at least one whitespace in-between.
-                        collected.push(b' ');
+                for item in array.raw_iter() {
+                    let Some(stream) = item.resolve(&self.ctx).and_then(|o| o.into_stream()) else {
+                        // A null or missing entry draws nothing: nothing is lost.
+                        continue;
+                    };
+                    match convert_single(stream) {
+                        Some(data) => {
+                            collected.extend(data);
+                            // Streams must have at least one whitespace in-between.
+                            collected.push(b' ');
+                        }
+                        None => complete = false,
                     }
-
-                    Some(collected)
-                } else {
-                    None
                 }
-            })
-            .as_ref()
-            .map(|d| d.as_slice())
+
+                (Some(collected), complete)
+            } else {
+                (None, true)
+            }
+        })
     }
 
     /// Get the resources of the page.

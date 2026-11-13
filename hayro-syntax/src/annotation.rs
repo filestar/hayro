@@ -1,5 +1,8 @@
 //! Appearances for annotations that carry none (no `AP` entry).
 //!
+//! Shared by hayro-interpret (which draws them) and hayro-write (which flattens them into a copied page), so a page
+//! looks the same rendered and copied.
+//!
 //! PDF 2.0 requires an appearance stream for every visible annotation, but many writers leave it out for
 //! the markup annotations (lines, shapes, ink, text highlights) and let the viewer draw them. Acrobat, pdf.js
 //! and Aspose do. This module writes a small content stream for each such annotation, following pdf.js's
@@ -7,20 +10,24 @@
 //! here as in the viewers people check it with. Text-bearing annotations (`FreeText`, the `Text` note icon)
 //! are not drawn: they need fonts and icons of the viewer's own.
 
-use hayro_syntax::object::dict::keys::{
+use crate::object::dict::keys::{
     BORDER, BS, C, CA, IC, INKLIST, L, QUADPOINTS, RECT, SUBTYPE, VERTICES, W,
 };
-use hayro_syntax::object::{Array, Dict, Name, Rect};
-use crate::util::RectExt;
-use std::fmt::Write;
+use crate::object::{Array, Dict, Name, Rect};
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::fmt::Write;
 
 /// A synthesised appearance: content stream operators in default user space, plus how to composite them.
-pub(crate) struct Synthesised {
-    pub(crate) ops: String,
-    /// The annotation's constant opacity (`CA`).
-    pub(crate) opacity: f32,
+#[derive(Debug, Clone)]
+pub struct Synthesised {
+    /// The operators, in default user space (no resources needed).
+    pub ops: String,
+    /// The annotation's constant opacity (`CA`), applied to the appearance as a whole (a transparency group).
+    pub opacity: f32,
     /// Text highlights multiply with what is under them.
-    pub(crate) multiply: bool,
+    pub multiply: bool,
 }
 
 enum Colour {
@@ -94,14 +101,20 @@ fn polyline(out: &mut String, points: &[f32]) -> bool {
     if points.len() < 4 {
         return false;
     }
-    for (i, p) in points.chunks_exact(2).enumerate() {
-        let _ = write!(out, "{} {} {} ", num(p[0]), num(p[1]), if i == 0 { "m" } else { "l" });
+    for (i, p) in points.as_chunks::<2>().0.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{} {} {} ",
+            num(p[0]),
+            num(p[1]),
+            if i == 0 { "m" } else { "l" }
+        );
     }
     true
 }
 
 /// Synthesise the appearance of an annotation without `AP`, or `None` when it draws nothing.
-pub(crate) fn synthesise(annot: &Dict<'_>) -> Option<Synthesised> {
+pub fn synthesise(annot: &Dict<'_>) -> Option<Synthesised> {
     let subtype = annot.get::<Name<'_>>(SUBTYPE)?;
     let opacity = annot.get::<f32>(CA).unwrap_or(1.0).clamp(0.0, 1.0);
     if opacity == 0.0 {
@@ -114,7 +127,7 @@ pub(crate) fn synthesise(annot: &Dict<'_>) -> Option<Synthesised> {
             Colour::Components(c) => Some(colour_op(&c, true)),
         }
     };
-    let black = [0.0f32, 0.0, 0.0];
+    let black = [0.0_f32, 0.0, 0.0];
     let mut ops = String::new();
     let mut multiply = false;
     match subtype.as_ref() {
@@ -182,7 +195,7 @@ pub(crate) fn synthesise(annot: &Dict<'_>) -> Option<Synthesised> {
             ops.push('S');
         }
         b"Square" | b"Circle" => {
-            let rect = annot.get::<Rect>(RECT)?.to_kurbo();
+            let rect = annot.get::<Rect>(RECT)?;
             let width = border_width(annot);
             let fill = colour_or_none(annot, IC);
             // pdf.js: a zero-width border with no fill would be a hairline nobody asked for.
@@ -195,7 +208,11 @@ pub(crate) fn synthesise(annot: &Dict<'_>) -> Option<Synthesised> {
             }
             let half = (width / 2.0) as f64;
             let (x0, y0) = (rect.x0.min(rect.x1) + half, rect.y0.min(rect.y1) + half);
-            let (w, h) = ((rect.width().abs() - 2.0 * half).max(0.0), (rect.height().abs() - 2.0 * half).max(0.0));
+            let (rw, rh) = (
+                rect.x0.max(rect.x1) - rect.x0.min(rect.x1),
+                rect.y0.max(rect.y1) - rect.y0.min(rect.y1),
+            );
+            let (w, h) = ((rw - 2.0 * half).max(0.0), (rh - 2.0 * half).max(0.0));
             if let Some(colour) = &colour {
                 let _ = write!(ops, "{colour} {} w ", num(width));
             }
@@ -203,7 +220,14 @@ pub(crate) fn synthesise(annot: &Dict<'_>) -> Option<Synthesised> {
                 let _ = write!(ops, "{fill} ");
             }
             if subtype.as_ref() == b"Square" {
-                let _ = write!(ops, "{} {} {} {} re ", num(x0 as f32), num(y0 as f32), num(w as f32), num(h as f32));
+                let _ = write!(
+                    ops,
+                    "{} {} {} {} re ",
+                    num(x0 as f32),
+                    num(y0 as f32),
+                    num(w as f32),
+                    num(h as f32)
+                );
             } else {
                 // Four Bézier quarters, as pdf.js writes them.
                 const K: f64 = 0.552_284_749_8;
@@ -214,11 +238,32 @@ pub(crate) fn synthesise(annot: &Dict<'_>) -> Option<Synthesised> {
                 let _ = write!(
                     ops,
                     "{} {} m {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c h ",
-                    p(cx), p(cy + ry),
-                    p(cx + ox), p(cy + ry), p(cx + rx), p(cy + oy), p(cx + rx), p(cy),
-                    p(cx + rx), p(cy - oy), p(cx + ox), p(cy - ry), p(cx), p(cy - ry),
-                    p(cx - ox), p(cy - ry), p(cx - rx), p(cy - oy), p(cx - rx), p(cy),
-                    p(cx - rx), p(cy + oy), p(cx - ox), p(cy + ry), p(cx), p(cy + ry),
+                    p(cx),
+                    p(cy + ry),
+                    p(cx + ox),
+                    p(cy + ry),
+                    p(cx + rx),
+                    p(cy + oy),
+                    p(cx + rx),
+                    p(cy),
+                    p(cx + rx),
+                    p(cy - oy),
+                    p(cx + ox),
+                    p(cy - ry),
+                    p(cx),
+                    p(cy - ry),
+                    p(cx - ox),
+                    p(cy - ry),
+                    p(cx - rx),
+                    p(cy - oy),
+                    p(cx - rx),
+                    p(cy),
+                    p(cx - rx),
+                    p(cy + oy),
+                    p(cx - ox),
+                    p(cy + ry),
+                    p(cx),
+                    p(cy + ry),
                 );
             }
             ops.push_str(match (colour.is_some(), fill.is_some()) {
@@ -245,7 +290,7 @@ pub(crate) fn synthesise(annot: &Dict<'_>) -> Option<Synthesised> {
                 b"StrikeOut" | b"Squiggly" => ops.push_str("[] 0 d 1 w "),
                 _ => {}
             }
-            for q in quads.chunks_exact(8) {
+            for q in quads.as_chunks::<8>().0 {
                 // Points in the order Acrobat writes them: upper left, upper right, lower left, lower right.
                 let (p0, p1, p2, p3) = ((q[0], q[1]), (q[2], q[3]), (q[4], q[5]), (q[6], q[7]));
                 match subtype.as_ref() {
@@ -253,11 +298,25 @@ pub(crate) fn synthesise(annot: &Dict<'_>) -> Option<Synthesised> {
                         let _ = write!(
                             ops,
                             "{} {} m {} {} l {} {} l {} {} l f ",
-                            num(p0.0), num(p0.1), num(p1.0), num(p1.1), num(p3.0), num(p3.1), num(p2.0), num(p2.1)
+                            num(p0.0),
+                            num(p0.1),
+                            num(p1.0),
+                            num(p1.1),
+                            num(p3.0),
+                            num(p3.1),
+                            num(p2.0),
+                            num(p2.1)
                         );
                     }
                     b"Underline" => {
-                        let _ = write!(ops, "{} {} m {} {} l S ", num(p2.0), num(p2.1 + 1.3), num(p3.0), num(p3.1 + 1.3));
+                        let _ = write!(
+                            ops,
+                            "{} {} m {} {} l S ",
+                            num(p2.0),
+                            num(p2.1 + 1.3),
+                            num(p3.0),
+                            num(p3.1 + 1.3)
+                        );
                     }
                     b"StrikeOut" => {
                         let _ = write!(
@@ -272,7 +331,9 @@ pub(crate) fn synthesise(annot: &Dict<'_>) -> Option<Synthesised> {
                     _ => {
                         let h = (p0.1 - p2.1) / 6.0;
                         let (mut x, y, end) = (p2.0, p2.1, p3.0);
-                        if !(h.is_finite() && x.is_finite() && end.is_finite()) || end - x > 100_000.0 {
+                        if !(h.is_finite() && x.is_finite() && end.is_finite())
+                            || end - x > 100_000.0
+                        {
                             continue;
                         }
                         let mut shift = h;
@@ -290,7 +351,11 @@ pub(crate) fn synthesise(annot: &Dict<'_>) -> Option<Synthesised> {
         }
         _ => return None,
     }
-    Some(Synthesised { ops, opacity, multiply })
+    Some(Synthesised {
+        ops,
+        opacity,
+        multiply,
+    })
 }
 
 /// A fill colour operator, or `None` when the key is absent or transparent.
